@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+.env
+.env.local
+app/.env
+
+app/artifacts/
+
+# APKs and extracted icons live outside the repo — see PLATFORM_DATA_DIR.
+*.apk
+*.apks
+*.part
+
+logs
+*.log
+
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
