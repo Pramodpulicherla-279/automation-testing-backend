@@ -79,9 +79,18 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.pa
 #     }
 # }
 
-def new_run() -> str:
-    """Create a fresh isolated state bucket and return its run_id."""
-    run_id = str(uuid.uuid4())
+def new_run(run_id: str | None = None) -> str:
+    """Create a fresh isolated state bucket and return its run_id.
+
+    The UI may supply the id (so it can recognise its run's live messages);
+    anything that isn't a fresh UUID is replaced with a new one.
+    """
+    try:
+        run_id = str(uuid.UUID(str(run_id)))
+    except ValueError:
+        run_id = None
+    if not run_id or run_id in runs:
+        run_id = str(uuid.uuid4())
     runs[run_id] = {
         "test_steps_store":  {},
         "pending_payloads":  [],
@@ -121,10 +130,11 @@ def new_run() -> str:
 #     except Exception as e:
 #         print(f"❌ Allure generate failed: {e}")
 
-def log_to_ui(message: str, status: str = "INFO"):
+def log_to_ui(message: str, status: str = "INFO", run_id: str | None = None):
     try:
         asyncio.create_task(manager.broadcast({
             "type": "LOG",
+            "run_id": run_id,
             "payload": {"message": message, "status": status},
         }))
     except Exception:
@@ -480,6 +490,7 @@ async def start_remote_run(
     login_phone:    str = None,
     login_mpin:     str = None,
     test_types:     list = None,
+    runner_id:      str = None,
 ) -> dict:
     """Record the run, announce it to the UI, and hand it to the runner.
 
@@ -494,13 +505,14 @@ async def start_remote_run(
     run["developer_name"] = developer_name or ""
     run["channel_id"]     = channel_id
     run["tests_to_run"]   = tests_to_run
+    run["runner_id"]      = runner_id
     if not run.get("app_variant"):
         run["app_variant"] = detect_app_variant(run.get("package_name", ""), app_name)
     print(f"[start_remote_run] app='{app_name}' ver='{app_version}' "
           f"dev='{developer_name}' variant='{run['app_variant']}'")
 
     # ── Broadcast a clean summary of what we resolved ────────────────────────
-    await manager.broadcast({
+    await manager.broadcast({"run_id": run_id, 
         "type": "LOG",
         "payload": {
             "message": (
@@ -510,14 +522,14 @@ async def start_remote_run(
             "status": "INFO",
         },
     })
-    await manager.broadcast({
+    await manager.broadcast({"run_id": run_id, 
         "type": "MODULES",
         "payload": {"run_id": run_id, "modules": tests_to_run},
     })
 
     # ── Step 1 — start the tests on the runner ───────────────────────────────
-    log_to_ui(f"[{run_id[:8]}] Step 1: Running tests on the runner...", "INFO")
-    result = await hub.request("start_run", timeout=30, payload={
+    log_to_ui(f"[{run_id[:8]}] Step 1: Running tests on the runner...", "INFO", run_id=run_id)
+    result = await hub.request("start_run", runner=runner_id, timeout=30, payload={
         "run_id":         run_id,
         "apk_name":       apk_name,
         "tests_to_run":   tests_to_run,
@@ -530,7 +542,7 @@ async def start_remote_run(
         "test_types":     test_types,
     })
     if result.get("skipped"):
-        await manager.broadcast({"type": "LOG", "payload": {
+        await manager.broadcast({"run_id": run_id, "type": "LOG", "payload": {
             "message": (f"Skipped {len(result['skipped'])} script(s) not found in the "
                         f"suite on the runner: {result['skipped']}"),
             "status": "WARN",
@@ -555,20 +567,20 @@ async def notify_run_finished(
     channel_id     = run.get("channel_id")
 
     if error:
-        log_to_ui(f"[{run_id[:8]}] Step 1 FAILED: {error}", "ERROR")
-        await manager.broadcast({"type": "LOG", "payload": {
+        log_to_ui(f"[{run_id[:8]}] Step 1 FAILED: {error}", "ERROR", run_id=run_id)
+        await manager.broadcast({"run_id": run_id, "type": "LOG", "payload": {
             "message": f"[PostRun] Tests failed: {error}", "status": "FAILED",
         }})
         return
-    log_to_ui(f"[{run_id[:8]}] Step 1 done{' (stopped by user)' if stopped else ''}", "SUCCESS")
+    log_to_ui(f"[{run_id[:8]}] Step 1 done{' (stopped by user)' if stopped else ''}", "SUCCESS", run_id=run_id)
 
-    await manager.broadcast({
+    await manager.broadcast({"run_id": run_id, 
         "type": "MODULES",
         "payload": {"run_id": run_id, "modules": run.get("tests_to_run", [])},
     })
 
     # ── Step 2 — pass/fail, counted by the runner from its allure-results ────
-    log_to_ui(f"[{run_id[:8]}] Step 2 done. Passed: {passed} | Failed: {failed}", "SUCCESS")
+    log_to_ui(f"[{run_id[:8]}] Step 2 done. Passed: {passed} | Failed: {failed}", "SUCCESS", run_id=run_id)
 
     # ── Step 4 — resolve report URL ──────────────────────────────────────────
     print(f"[{run_id[:8]}] Step 3: Resolving report URL...")
@@ -589,7 +601,7 @@ async def notify_run_finished(
     # ghpages_url = await loop.run_in_executor(None, lambda: deploy_to_github_pages(run_id))
     # 4. Decide final URL
     # if not ghpages_url:
-    #     log_to_ui(f"[{run_id[:8]}] GitHub Pages deploy failed", "ERROR")
+    #     log_to_ui(f"[{run_id[:8]}] GitHub Pages deploy failed", "ERROR", run_id=run_id)
     #     return   # STOP execution
     # report_url = ghpages_url
 
@@ -607,7 +619,7 @@ async def notify_run_finished(
 
     if not final_channel_id:
         print("[ERROR] No Slack channel found even after fallback")
-        await manager.broadcast({
+        await manager.broadcast({"run_id": run_id, 
             "type": "LOG",
             "payload": {
                 "message": "Slack notification skipped: No channel_id found",
@@ -641,8 +653,8 @@ async def notify_run_finished(
                 report_url=report_url,
             ),
         )
-        log_to_ui(f"[{run_id[:8]}] Step 5 done. Slack notification sent", "SUCCESS")
-        await manager.broadcast({
+        log_to_ui(f"[{run_id[:8]}] Step 5 done. Slack notification sent", "SUCCESS", run_id=run_id)
+        await manager.broadcast({"run_id": run_id, 
             "type": "LOG",
             "payload": {
                 "message": f"Slack report sent! Passed: {passed} | Failed: {failed}",
@@ -651,7 +663,7 @@ async def notify_run_finished(
         })
     except Exception as e:
         print(f"[PostRun] Step 5 FAILED: {e}")
-        await manager.broadcast({
+        await manager.broadcast({"run_id": run_id, 
             "type": "LOG",
             "payload": {"message": f"Slack notification failed: {e}", "status": "WARN"},
         })

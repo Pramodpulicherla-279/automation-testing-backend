@@ -1,6 +1,6 @@
-"""Status of the laptop's test runner, and the WebSocket it connects to.
+"""Which laptops have a test runner connected, and the WebSocket they connect to.
 
-See app/core/runner_hub.py for how the connection works.
+See app/core/runner_hub.py for how the connections work.
 """
 
 from fastapi import APIRouter, WebSocket
@@ -12,6 +12,7 @@ router = APIRouter()
 
 @router.get("/status")
 async def runner_status():
+    """{"connected": bool, "runners": [{id, device_connected, device, appium, busy, connected_at}]}"""
     return hub.status()
 
 

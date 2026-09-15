@@ -739,7 +739,7 @@ def run_tests_flow(payload: schemas.TestRunCreate, db: Session) -> dict:
 # the runner offline these panels are empty rather than errors.
 async def discover_automation_tests_flow(path: str) -> list[dict]:
     try:
-        return await hub.request("discover_tests", {"path": path}, timeout=15)
+        return await hub.request("discover_tests", {"path": path}, any_runner=True, timeout=15)
     except RunnerUnavailable:
         return []
 
@@ -747,7 +747,7 @@ async def discover_automation_tests_flow(path: str) -> list[dict]:
 async def discover_type_folder_flow(type_label: str) -> list[dict]:
     """Folder tests physically under tests/test_suites/<type>/ (folder = type authority)."""
     try:
-        return await hub.request("discover_type_folder", {"type": type_label}, timeout=15)
+        return await hub.request("discover_type_folder", {"type": type_label}, any_runner=True, timeout=15)
     except RunnerUnavailable:
         return []
 

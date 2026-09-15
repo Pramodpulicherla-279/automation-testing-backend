@@ -3,8 +3,8 @@
 FastAPI backend for the test automation platform: the test management database
 and API, the WebSocket the UI listens on, Jira and Slack integration, and
 orchestration of test runs. The runs themselves — Android device, Appium, APKs,
-pytest, Allure — happen on the **test runner** in the
-[`automation-testing`](../automation-testing) repo, on the laptop.
+pytest, Allure — happen on **test runners** on the laptops (the `runner`
+package in [`automation-testing`](../automation-testing)).
 
 Split out of the `test-automation-platform` mono repo alongside
 [`automation-testing`](../automation-testing) and
@@ -15,43 +15,47 @@ package was renamed `new_backend` → `app` in the process.
 
 ```
 app/                        the FastAPI application (was new_backend/)
-app/core/runner_hub.py      the connection to the test runner
-app/modules/runner/         /runner/status and the runner's WebSocket (/runner/ws)
+app/core/runner_hub.py      the connections to the laptops' test runners
+app/modules/runner/         /runner/status and the runners' WebSocket (/runner/ws)
 migrations/                 Alembic migrations
 alembic.ini                 script_location = migrations
 ```
 
-## How it reaches the laptop
+## How it reaches the laptops
 
-Nothing on this side knows the laptop's address. The runner connects **out** to
-this backend at `/runner/ws` and keeps the WebSocket open. Commands go down it,
-and replies, a status heartbeat and run-finished events come back up:
+Nothing on this side knows a laptop's address. Each laptop's runner connects
+**out** to `/runner/ws` and keeps the WebSocket open. Commands go down it, and
+replies, a status heartbeat and run-finished events come back up. The repos
+share no code or file paths; everything goes over URLs.
 
 ```
-frontend ──HTTPS──► backend ◄──WebSocket (opened by the laptop)── runner
-                       ▲                                           │ pytest · Appium · adb · APKs
-                       └──── logs, module status, results (HTTPS) ─┘
+                        ┌──WebSocket (opened by laptop A)── runner A + phone
+frontend ──HTTPS──► backend
+                        └──WebSocket (opened by laptop B)── runner B + phone
 ```
 
-The repos share no code or file paths; everything goes over these URLs. There
-is no authentication anywhere: whatever connects to `/runner/ws` is the runner,
-and the newest connection replaces an older one. That is also how the laptop
-reconnects after a drop or a backend redeploy. The connection lives in this
-process, so run the backend as a **single process** (no multiple workers or
-instances).
+- **Laptops are named** by their runner: the laptop's hostname, or its
+  `RUNNER_NAME`. `GET /runner/status` lists the connected ones, with each
+  one's phone, Appium state and whether it's busy. A new connection under a
+  name already connected replaces the old one, which is how a laptop reconnects.
+- **Laptop endpoints take `?runner=<name>`**: device and Appium status, Appium
+  start and stop, the APK list, stop, reports. Starting a run takes
+  `runner_id` in the body. With exactly one laptop connected, you can leave it
+  out.
+- **Reading test sources** (`/api/automation-tests`, `/api/test-type-tests`)
+  can go to any laptop, since they all have the same suite.
+- **Live messages carry the run's id.** All laptops' runs share the
+  `/ws/test-status` feed, and each screen shows only the run it started. The
+  UI supplies the run id when it starts a run, so it can recognize its run
+  from the very first message.
+- **When a laptop isn't available:** status polls read "no device" / "Appium
+  stopped", and the APK and test lists come back empty. Actions answer **503**
+  with the reason, such as the laptop not being connected, or several laptops
+  being connected and none chosen.
 
-The `/test/*` endpoints keep their paths and payloads, so the frontend didn't
-change. Behind them:
-
-- **Status polls** (`/test/device-status`, `/test/appium/status`) answer from
-  the runner's latest heartbeat. With no runner they read as "no device" and
-  "Appium stopped".
-- **Lists the page loads on open** (`/test/apk-list`, `/api/automation-tests`,
-  `/api/test-type-tests`) come from the runner. With no runner they are empty,
-  not errors.
-- **Actions** (start and stop runs, Appium start and stop, reports) are
-  commands to the runner. With no runner they answer **503** with the reason.
-- `GET /runner/status` reports whether a runner is connected, and which machine.
+There is no authentication: anything that connects to `/runner/ws` is treated as
+a laptop. Connection state lives in this process, so run the backend as a
+**single process** (no multiple workers or instances).
 
 ## Where it can run
 

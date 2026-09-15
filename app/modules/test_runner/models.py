@@ -3,6 +3,7 @@ from typing import List, Dict, Optional
 
 class RunCompleteEvent(BaseModel):
     report_url: str
+    run_id: Optional[str] = None
 
 class ExistingTestRequest(BaseModel):
     apk_name: str
@@ -11,6 +12,8 @@ class ExistingTestRequest(BaseModel):
     # state_farmer | state_client). Drives post-login landed-app detection & switch.
     app_type: Optional[str] = None
     run_id: Optional[str] = None
+    # The laptop picked in the UI; optional while only one is connected.
+    runner_id: Optional[str] = None
     # Mobile number + MPIN provided in the UI to log in with (overrides accounts.json).
     login_phone: Optional[str] = None
     login_mpin: Optional[str] = None
@@ -21,12 +24,14 @@ class ExistingTestRequest(BaseModel):
 class LogMessage(BaseModel):
     message: str
     status: str = "INFO"
+    run_id: Optional[str] = None
 
 class TestRequest(BaseModel):
     url: str
     tests_to_run: Optional[List[Dict[str, str]]] = None
     app_type: Optional[str] = None
     run_id: Optional[str] = None
+    runner_id: Optional[str] = None
     login_phone: Optional[str] = None
     login_mpin: Optional[str] = None
     test_types: Optional[List[str]] = None
