@@ -3,10 +3,10 @@ import os
 import asyncio
 import sys
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from app.core.paths import APK_ICON_DIR, ensure_apk_dirs
+from fastapi.responses import JSONResponse
+from app.core.runner_client import RunnerUnavailable
 from app.modules.test_runner.routes import router as test_router
 from app.modules.jira.routes import router as jira_router
 from app.modules.llm.routes import router as llm_router
@@ -30,18 +30,33 @@ app = FastAPI(
 
 # app = FastAPI(lifespan=lifespan)
 
+
+# Device, Appium, APK, run and discovery endpoints go through the runner on the
+# machine with the Android device. When it can't be used they answer 503 with the
+# reason instead of a bare 500, and everything else keeps working.
+@app.exception_handler(RunnerUnavailable)
+async def runner_unavailable(request: Request, exc: RunnerUnavailable):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+# Origins must be listed explicitly: credentials are allowed, and the CORS spec
+# forbids combining that with a "*" wildcard. Trailing slashes are stripped
+# because browsers send the Origin header without one.
+CORS_ALLOW_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True, 
     allow_methods=["*"], 
     allow_headers=["*"],
 )
-
-# Icons are extracted from APKs into the runtime data dir, outside the repo;
-# this is what makes the /static/icons/… URLs handed to the UI resolvable.
-ensure_apk_dirs()
-app.mount("/static/icons", StaticFiles(directory=APK_ICON_DIR), name="apk-icons")
 
 app.include_router(websocket_router, prefix="/ws")
 app.include_router(test_router, prefix="/test")

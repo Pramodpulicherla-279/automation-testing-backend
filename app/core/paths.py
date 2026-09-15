@@ -1,8 +1,11 @@
-"""Filesystem roots shared by the backend.
+"""Filesystem roots.
 
-The automation suite lives in its own repo (`automation-testing`) since the mono
-repo was split, but the backend still runs it, parses its sources and serves its
-Allure output. Set TESTS_REPO_PATH when the two checkouts are not siblings.
+The backend service itself never needs these on a cloud host: device, APK and
+run work goes through the runner (see runner_client.py). They matter where the
+runner imports backend modules as a library, on the machine with both repos:
+test-source discovery reads the sibling `automation-testing` repo, and APKs live
+in the machine-wide data dir below. Set TESTS_REPO_PATH when the two checkouts
+are not siblings.
 """
 
 import os

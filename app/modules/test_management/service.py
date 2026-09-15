@@ -31,7 +31,8 @@ from app.modules.test_management.db_models import (
     TestRunResult,
 )
 from app.modules.test_management.runner import runner_service
-from app.modules.test_management.discovery import discover_automation_tests, discover_type_folder, normalize_match_key
+from app.core import runner_client
+from app.modules.test_management.discovery import normalize_match_key
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -734,13 +735,14 @@ def run_tests_flow(payload: schemas.TestRunCreate, db: Session) -> dict:
     }
 
 
+# Test sources live with the suite on the runner's machine, so it reads them.
 def discover_automation_tests_flow(path: str) -> list[dict]:
-    return discover_automation_tests(path)
+    return runner_client.call("GET", "/discovery/automation-tests", params={"path": path}, timeout=15)
 
 
 def discover_type_folder_flow(type_label: str) -> list[dict]:
     """Folder tests physically under tests/test_suites/<type>/ (folder = type authority)."""
-    return discover_type_folder(type_label)
+    return runner_client.call("GET", "/discovery/type-folder", params={"type": type_label}, timeout=15)
 
 
 def list_test_runs_flow(

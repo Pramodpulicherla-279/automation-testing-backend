@@ -12,12 +12,8 @@ import uuid
 import datetime
 import sys
 import socket
-from app.core.paths import ensure_tests_importable
-
-PROJECT_ROOT = ensure_tests_importable()
-from tests.test_runner import (
-    run_tests_and_get_suggestions,
-)
+from app.core import runner_client
+from app.core.paths import TESTS_ROOT
 from app.core.state import runs, is_appium_running, APPIUM_PORT, PROCESSED_EVENTS, appium_proc, latest_run_id
 from app.core.utils import start_allure_server
 from app.core.websocket import manager
@@ -25,7 +21,7 @@ from app.modules.test_runner.gdrive_loader import get_apk_info
 from app.core.constants import SLACK_BOT_TOKEN, SLACK_NOTIFY_CHANNEL, ALLURE_CMD
 from .config import APP_CONFIG, PACKAGE_VARIANT_MAP, APP_VARIANTS, APP_DEVELOPER_MAP
 
-BASE_DIR = PROJECT_ROOT
+BASE_DIR = str(TESTS_ROOT)
 print(f"[DEBUG] BASE_DIR = {BASE_DIR}")
 print(f"[DEBUG] allure-results path = {os.path.join(BASE_DIR, 'allure-results')}")
 
@@ -474,12 +470,10 @@ def extract_drive_file_id(text: str) -> str | None:
     match = re.search(r'/d/([a-zA-Z0-9_-]+)', text)
     return match.group(1) if match else None
 
-def run_post_notify(**kwargs) -> None:
-    asyncio.run(post_run_notify(**kwargs))
-
-async def post_run_notify(
+async def start_remote_run(
+    *,
     run_id:         str,
-    apk_path:       str,
+    apk_name:       str,
     tests_to_run:   list,
     app_name:       str,
     app_version:    str,
@@ -489,115 +483,95 @@ async def post_run_notify(
     login_phone:    str = None,
     login_mpin:     str = None,
     test_types:     list = None,
-) -> None:
-    loop = asyncio.get_event_loop()
+) -> dict:
+    """Record the run, announce it to the UI, and hand it to the runner.
 
+    The runner executes it in the background on the machine with the device and
+    posts the outcome to /test/runner/run-finished, which calls
+    notify_run_finished() below.
+    """
     # ── Store app metadata into run state RIGHT NOW so tests can fetch it ─────
-    if run_id in runs:
-        runs[run_id]["app_name"]       = app_name       or ""
-        runs[run_id]["app_version"]    = app_version     or ""
-        runs[run_id]["developer_name"] = developer_name  or ""
-        if not runs[run_id].get("app_variant"):
-            runs[run_id]["app_variant"] = detect_app_variant(
-                runs[run_id].get("package_name", ""),
-                app_name,
-            )
-        print(f"[post_run_notify] app_variant resolved → {runs[run_id]['app_variant']}")
-    print(f"[post_run_notify] Metadata stored → "
-          f"app='{app_name}' ver='{app_version}' dev='{developer_name}'")
+    run = runs.setdefault(run_id, {})
+    run["app_name"]       = app_name       or ""
+    run["app_version"]    = app_version    or ""
+    run["developer_name"] = developer_name or ""
+    run["channel_id"]     = channel_id
+    run["tests_to_run"]   = tests_to_run
+    if not run.get("app_variant"):
+        run["app_variant"] = detect_app_variant(run.get("package_name", ""), app_name)
+    print(f"[start_remote_run] app='{app_name}' ver='{app_version}' "
+          f"dev='{developer_name}' variant='{run['app_variant']}'")
 
     # ── Broadcast a clean summary of what we resolved ────────────────────────
     await manager.broadcast({
         "type": "LOG",
         "payload": {
             "message": (
-                f"📦 App: {app_name} | Version: {app_version} | "
+                f"\U0001F4E6 App: {app_name} | Version: {app_version} | "
                 f"Developer: {developer_name} | Tests: {len(tests_to_run)}"
             ),
             "status": "INFO",
         },
     })
-
     await manager.broadcast({
         "type": "MODULES",
         "payload": {"run_id": run_id, "modules": tests_to_run},
     })
 
-    # ── Clear allure-results ONLY here, BEFORE running tests ─────────────────
-    results_dir = os.path.join(BASE_DIR, "allure-results")
-    try:
-        if os.path.isdir(results_dir):
-            # shutil.rmtree(results_dir)
-            os.makedirs(results_dir, exist_ok=True)
-        log_to_ui(f"[{run_id[:8]}] Cleared stale allure-results before run", "INFO")
-    except Exception as e:
-        log_to_ui(f"[{run_id[:8]}] Could not clear allure-results: {e}", "WARN")
-
-    # ── Step 1 — run tests ───────────────────────────────────────────────────
-    log_to_ui(f"[{run_id[:8]}] Step 1: Running tests...", "INFO")
-    try:
-        await loop.run_in_executor(
-            None,
-            lambda: run_tests_and_get_suggestions(
-                apk_path,
-                tests_to_run=tests_to_run,
-                app_type=app_type,
-                app_name=app_name,
-                app_version=app_version,
-                developer_name=developer_name,
-                run_id=run_id,
-                login_phone=login_phone,
-                login_mpin=login_mpin,
-                test_types=test_types,
-            ),
-        )
-        log_to_ui(f"[{run_id[:8]}] Step 1 done", "SUCCESS")
-    except Exception as e:
-        log_to_ui(f"[{run_id[:8]}] Step 1 FAILED: {e}", "ERROR")
+    # ── Step 1 — start the tests on the runner ───────────────────────────────
+    log_to_ui(f"[{run_id[:8]}] Step 1: Running tests on the runner...", "INFO")
+    result = await runner_client.acall("POST", "/runs", timeout=30, json={
+        "run_id":         run_id,
+        "apk_name":       apk_name,
+        "tests_to_run":   tests_to_run,
+        "app_type":       app_type,
+        "app_name":       app_name,
+        "app_version":    app_version,
+        "developer_name": developer_name,
+        "login_phone":    login_phone,
+        "login_mpin":     login_mpin,
+        "test_types":     test_types,
+    })
+    if result.get("skipped"):
         await manager.broadcast({"type": "LOG", "payload": {
-            "message": f"[PostRun] Tests failed: {e}", "status": "FAILED",
+            "message": (f"Skipped {len(result['skipped'])} script(s) not found in the "
+                        f"suite on the runner: {result['skipped']}"),
+            "status": "WARN",
+        }})
+    return result
+
+
+async def notify_run_finished(
+    run_id: str,
+    *,
+    passed: int,
+    failed: int,
+    stopped: bool = False,
+    error: str = None,
+) -> None:
+    """Runner callback: a run ended. Announce the outcome and send the Slack summary."""
+    loop = asyncio.get_event_loop()
+    run = runs.get(run_id, {})
+    app_name       = run.get("app_name")
+    app_version    = run.get("app_version")
+    developer_name = run.get("developer_name")
+    channel_id     = run.get("channel_id")
+
+    if error:
+        log_to_ui(f"[{run_id[:8]}] Step 1 FAILED: {error}", "ERROR")
+        await manager.broadcast({"type": "LOG", "payload": {
+            "message": f"[PostRun] Tests failed: {error}", "status": "FAILED",
         }})
         return
+    log_to_ui(f"[{run_id[:8]}] Step 1 done{' (stopped by user)' if stopped else ''}", "SUCCESS")
 
     await manager.broadcast({
         "type": "MODULES",
-        "payload": {"run_id": run_id, "modules": tests_to_run},
+        "payload": {"run_id": run_id, "modules": run.get("tests_to_run", [])},
     })
 
-    # ── Step 2 — count pass/fail ──────────────────────────────────────────────
-    passed = failed = 0
-    try:
-        report_results_dir = os.path.join(BASE_DIR, "allure-report", "data", "test-cases")
-        scan_dir = report_results_dir if os.path.isdir(report_results_dir) else results_dir
-        for json_file in glob.glob(os.path.join(scan_dir, "*.json")):
-            try:
-                with open(json_file, "r", encoding="utf-8") as f:
-                    result_data = json.load(f)
-                status = (result_data.get("status") or result_data.get("testStage", {}).get("status") or "").upper()
-                if status == "PASSED":
-                    passed += 1
-                elif status in ("FAILED", "BROKEN"):
-                    failed += 1
-            except Exception:
-                pass
-
-        for json_file in glob.glob(os.path.join(results_dir, "*-result.json")):
-            try:
-                with open(json_file, "r", encoding="utf-8") as f:
-                    result_data = json.load(f)
-                status = result_data.get("status", "").upper()
-                if status == "PASSED":
-                    passed += 1
-                elif status in ("FAILED", "BROKEN"):
-                    failed += 1
-            except Exception:
-                pass
-        log_to_ui(f"[{run_id[:8]}] Step 2 done. Passed: {passed} | Failed: {failed}", "SUCCESS")
-    except Exception as e:
-        print(f"[PostRun] Step 2 FAILED: {e}")
-
-    # ── Broadcast captured steps for this run ────────────────────────────────
-    # await _broadcast_all_steps_to_frontend(run_id)
+    # ── Step 2 — pass/fail, counted by the runner from its allure-results ────
+    log_to_ui(f"[{run_id[:8]}] Step 2 done. Passed: {passed} | Failed: {failed}", "SUCCESS")
 
     # ── Step 4 — resolve report URL ──────────────────────────────────────────
     print(f"[{run_id[:8]}] Step 3: Resolving report URL...")
@@ -618,13 +592,13 @@ async def post_run_notify(
     # ghpages_url = await loop.run_in_executor(None, lambda: deploy_to_github_pages(run_id))
     # 4. Decide final URL
     # if not ghpages_url:
-    #     log_to_ui(f"[{run_id[:8]}] ❌ GitHub Pages deploy failed", "ERROR")
-    #     return   # 🚨 STOP execution
+    #     log_to_ui(f"[{run_id[:8]}] GitHub Pages deploy failed", "ERROR")
+    #     return   # STOP execution
     # report_url = ghpages_url
 
     # Temporary fallback: serve the Allure report locally via FastAPI.
     report_url = "http://localhost:8000/allure-report/index.html"
-    print(f"[{run_id[:8]}] Step 3: Report URL → {report_url}")
+    print(f"[{run_id[:8]}] Step 3: Report URL -> {report_url}")
 
     if run_id in runs:
         runs[run_id]["report_url"] = report_url
@@ -639,7 +613,7 @@ async def post_run_notify(
         await manager.broadcast({
             "type": "LOG",
             "payload": {
-                "message": "⚠️ Slack notification skipped: No channel_id found",
+                "message": "Slack notification skipped: No channel_id found",
                 "status": "WARN",
             },
         })
@@ -651,41 +625,38 @@ async def post_run_notify(
     print(f"[FINAL DEBUG] app_version    = '{app_version}'")
 
     try:
-        app_variant = runs.get(run_id, {}).get("app_variant")
+        app_variant = run.get("app_variant")
         config = APP_CONFIG.get(app_variant)
         if not config:
-           print(f"[ERROR] No config for app_variant={app_variant}")
-           return
+            print(f"[ERROR] No config for app_variant={app_variant}")
+            return
 
         await loop.run_in_executor(
             None,
             lambda: send_slack_message(
-            channel_id = config.get("channel_id") or final_channel_id,
-            developer_name=config.get("developer_name"),
-            slack_user_id=config.get("slack_user_id"),   # 🔥 ADD THIS
-            app_name=app_name,
-            apk_version=app_version,
-            passed=passed,
-            failed=failed,
-            report_url=report_url,
-        ),
+                channel_id=config.get("channel_id") or final_channel_id,
+                developer_name=config.get("developer_name"),
+                slack_user_id=config.get("slack_user_id"),
+                app_name=app_name,
+                apk_version=app_version,
+                passed=passed,
+                failed=failed,
+                report_url=report_url,
+            ),
         )
         log_to_ui(f"[{run_id[:8]}] Step 5 done. Slack notification sent", "SUCCESS")
         await manager.broadcast({
             "type": "LOG",
             "payload": {
-                "message": f"✅ Slack report sent! Passed: {passed} | Failed: {failed}",
+                "message": f"Slack report sent! Passed: {passed} | Failed: {failed}",
                 "status": "INFO",
             },
         })
-        if not config:
-           print(f"[ERROR] No config found for app_variant={app_variant}")
-        return
     except Exception as e:
         print(f"[PostRun] Step 5 FAILED: {e}")
         await manager.broadcast({
             "type": "LOG",
-            "payload": {"message": f"⚠️ Slack notification failed: {e}", "status": "WARN"},
+            "payload": {"message": f"Slack notification failed: {e}", "status": "WARN"},
         })
 
 def get_slack_user_name(user_id: str) -> str:
@@ -860,27 +831,6 @@ def _get_full_apk_info(apk_path: str) -> dict:
 
     return info
 
-async def _ensure_appium_running() -> None:
-    global appium_proc
-    if is_appium_running():
-        print("[Appium] Already running.")
-        return
-    print("[Appium] Starting Appium server...")
-    appium_proc = subprocess.Popen(
-        ["appium", "-p", str(APPIUM_PORT)],
-        shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    for _ in range(15):
-        await asyncio.sleep(1)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", APPIUM_PORT)) == 0:
-                print("[Appium] Server is ready.")
-                return
-    print("[Appium] WARNING: Appium did not become reachable within 15 s.")
-
-
 async def handle_slack_apk(
     file_id: str,
     channel_id: str,
@@ -902,63 +852,17 @@ async def handle_slack_apk(
             },
         })
 
-        # ── Download APK via thread executor (Windows-safe) ──────────────────
-        script_path = os.path.join(os.path.dirname(__file__), "gdrive_loader.py")
-        loop = asyncio.get_event_loop()
-
-        def _run_download():
-            dl_env = os.environ.copy()
-            dl_env["PYTHONIOENCODING"] = "utf-8"
-            dl_env["PYTHONUTF8"]       = "1"   # Python 3.7+ UTF-8 mode flag
-            return subprocess.run(
-                [sys.executable, "-u", script_path, download_url],
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                env=dl_env,
-                timeout=300,
-            )
- 
-        result = await loop.run_in_executor(None, _run_download)
-        stdout_text = result.stdout or ""
-        stderr_text = result.stderr or ""
- 
-        apk_path = None
-        for line in stdout_text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("PROGRESS:"):
-                await manager.broadcast({
-                    "type": "LOG",
-                    "payload": {
-                        "message": line.replace("PROGRESS:", "").strip(),
-                        "status": "PROGRESS",
-                    },
-                })
-            elif line.startswith("RESULT:"):
-                apk_path = line.replace("RESULT:", "").strip()
-            else:
-                await manager.broadcast({
-                    "type": "LOG",
-                    "payload": {"message": line, "status": "INFO"},
-                })
- 
-        if result.returncode != 0:
-            raise Exception(
-                f"Download failed (exit {result.returncode}): "
-                f"{stderr_text.strip() or 'Unknown error'}"
-            )
-        if not apk_path:
-            raise Exception("Download script finished but returned no APK path.")
- 
-        # ── Rest of the handler stays the same ───────────────────────────────
-        loop = asyncio.get_event_loop()
-        info         = await loop.run_in_executor(None, lambda: _get_full_apk_info(apk_path))
+        # ── The runner downloads the APK onto the machine with the device ─────
+        prepared = await runner_client.acall(
+            "POST", "/apks/prepare", json={"url": download_url},
+            timeout=runner_client.DOWNLOAD_TIMEOUT,
+        )
+        info         = _normalize_apk_info(prepared.get("info"))
         package_name = info["package_name"]
         app_name     = info["app_name"]
         app_version  = info["app_version"]
- 
+
+        loop = asyncio.get_event_loop()
         app_variant    = detect_app_variant(package_name, app_name)
         runs[run_id]["app_variant"] = app_variant
         tests_to_run   = APP_VARIANTS.get(app_variant, [])
@@ -969,14 +873,14 @@ async def handle_slack_apk(
             )
         if not developer_name:
             developer_name = "Unknown Developer"
- 
+
         if run_id in runs:
             runs[run_id]["package_name"]   = package_name  or ""
             runs[run_id]["app_variant"]    = app_variant    or ""
             runs[run_id]["app_name"]       = app_name       or ""
             runs[run_id]["app_version"]    = app_version    or ""
             runs[run_id]["developer_name"] = developer_name or ""
- 
+
         await manager.broadcast({
             "type": "LOG",
             "payload": {
@@ -987,19 +891,21 @@ async def handle_slack_apk(
                 "status": "INFO",
             },
         })
- 
-        await _ensure_appium_running()
- 
-        await post_run_notify(
+
+        # No one is at the UI to press Start, so bring Appium up and wait for it.
+        await runner_client.acall("POST", "/appium/start", params={"wait": 15}, timeout=30)
+
+        await start_remote_run(
             run_id=run_id,
-            apk_path=apk_path,
+            apk_name=prepared["apk_name"],
             tests_to_run=tests_to_run,
             app_name=app_name,
             app_version=app_version,
             developer_name=developer_name,
             channel_id=channel_id,
+            app_type=app_variant,
         )
- 
+
     except Exception as e:
         import traceback
         full_error = traceback.format_exc()

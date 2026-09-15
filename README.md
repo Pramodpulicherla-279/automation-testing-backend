@@ -1,8 +1,11 @@
 # automation-testing-backend
 
-FastAPI backend for the test automation platform. Orchestrates test runs, Appium
-and ADB, Allure reporting, Jira and Slack integration, APK handling and the test
-management database.
+FastAPI backend for the test automation platform: the test management database
+and API, the WebSocket the UI listens on, Jira and Slack integration, and
+orchestration of test runs. The runs themselves (the Android device, Appium,
+APKs, pytest and Allure) happen on the **runner** in the
+[`automation-testing`](../automation-testing) repo, which this service calls
+over HTTP.
 
 Split out of the `test-automation-platform` mono repo alongside
 [`automation-testing`](../automation-testing) and
@@ -12,68 +15,63 @@ package was renamed `new_backend` → `app` in the process.
 ## Layout
 
 ```
-app/                 the FastAPI application (was new_backend/)
-app/core/paths.py    locates the sibling tests repo and the runtime data dir
-migrations/          Alembic migrations
-alembic.ini          script_location = migrations
+app/                        the FastAPI application (was new_backend/)
+app/core/runner_client.py   HTTP client for the runner (RUNNER_URL, RUNNER_TOKEN)
+app/core/paths.py           filesystem roots, used where the runner imports this package
+migrations/                 Alembic migrations
+alembic.ini                 script_location = migrations
 ```
 
-## APK storage
-
-APKs and the icons extracted from them are **not** kept in the repo — they are
-hundreds of megabytes each and a redeploy or fresh clone would lose them. They
-live in a machine-wide data directory instead:
+## How it reaches the device
 
 ```
-%PROGRAMDATA%\TestAutomationPlatform\
-├── apks\     served to the UI by GET /test/apk-list
-└── icons\    served at /static/icons/<name>.png
+frontend ──HTTP──► backend ──HTTP + RUNNER_TOKEN──► runner (laptop)
+                     ▲                                 │  pytest · Appium · adb · APKs
+                     └──── logs, module status, ───────┘
+                           run-finished
 ```
 
-On Windows this is shared across user accounts, which matters because the
-backend runs under a secondary one. Elsewhere it defaults to
-`~/.test-automation-platform`.
+The `/test/*` endpoints keep their paths and payloads, so the frontend is
+unchanged. Behind them, each call goes to the runner:
 
-Override with `PLATFORM_DATA_DIR` — that is the knob CI should set, pointing at
-a workspace or cache path so APKs persist between pipeline runs:
+| Backend endpoint | Runner call |
+|---|---|
+| `GET /test/device-status` | `GET /device-status` |
+| `GET /test/appium/status`, `POST /test/appium/start` · `stop` | `/appium/…` |
+| `GET /test/apk-list` | `GET /apks` |
+| `POST /test/start-test`, `/test/start-test-existing` | `POST /apks/prepare`, then `POST /runs` |
+| `POST /test/stop-test` | `POST /runs/stop` |
+| `POST /test/generate-report`, `/test/allure/start` | `POST /report`, `POST /allure/start` |
+| `GET /api/automation-tests`, `/api/test-type-tests` | `GET /discovery/…` |
 
-```bash
-PLATFORM_DATA_DIR=D:\ci\test-automation-data
-```
+A run executes in the background on the runner. When it ends, the runner calls
+`POST /test/runner/run-finished` (checked against `RUNNER_TOKEN`), which sends
+the Slack summary.
 
-`APK_STORAGE_DIR` and `APK_ICON_DIR` override the two folders individually. All
-three are read in `app/core/paths.py`; the directories are created on startup,
-so a fresh machine or CI runner needs no manual setup.
+If the runner can't be reached, or rejects the token, those endpoints answer
+**503** with the reason. The two status polls instead read as "no device" and
+"Appium stopped", so the UI isn't flooded with errors. The rest of the API is
+unaffected.
 
-## Requires the tests repo
+## Where it can run
 
-This service does not just talk to the automation suite, it loads it: it imports
-`tests.test_runner`, reads `tests.test_type_config`, AST-parses files under
-`tests/`, runs the `ui-parser` validator and serves Allure output generated
-there. It expects `automation-testing` as a **sibling folder**:
+Anywhere. It no longer needs the tests repo, adb, Appium or Allure on its own
+host. For a cloud deploy (e.g. Render), set:
 
-```
-Projects/
-├── automation-testing/
-└── automation-testing-backend/
-```
-
-If your checkouts are not side by side, set `TESTS_REPO_PATH` (see
-`.env.example`).
-
-## This service is machine-bound
-
-It shells out to `adb`, Appium and the Allure CLI, and drives a physically
-connected Android device. It is meant to run on the laptop that has those, not
-on a cloud host. To reach it from a frontend deployed elsewhere, expose it
-through a tunnel and point `VITE_API_BASE_URL` at that URL.
+- `RUNNER_URL` — the tunnel URL that reaches the runner on the laptop.
+- `RUNNER_TOKEN` — the same value the runner uses.
+- `CORS_ALLOW_ORIGINS` — include the deployed frontend's URL, or the browser
+  blocks every call.
+- `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` /
+  `MYSQL_DATABASE` — they default to `localhost`, which doesn't exist on Render.
+  `app/.env` is gitignored, so set these as service environment variables.
 
 ## Setup
 
 ```bash
 python -m venv .venv && .venv/Scripts/activate
 pip install -r requirements.txt
-cp .env.example .env          # TESTS_REPO_PATH, ALLURE_CMD
+cp .env.example .env          # RUNNER_URL, RUNNER_TOKEN, CORS_ALLOW_ORIGINS
 cp app/.env.example app/.env  # DB and integration secrets
 ```
 
@@ -82,6 +80,9 @@ cp app/.env.example app/.env  # DB and integration secrets
 ```bash
 python -X utf8 -m uvicorn app.main:app --reload --port 8000
 ```
+
+Start the runner as well (see the `automation-testing` README). Without it the
+UI shows no device and runs can't start.
 
 Migrations:
 
