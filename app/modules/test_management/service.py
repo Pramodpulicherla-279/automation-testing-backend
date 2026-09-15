@@ -31,7 +31,7 @@ from app.modules.test_management.db_models import (
     TestRunResult,
 )
 from app.modules.test_management.runner import runner_service
-from app.core import runner_client
+from app.core.runner_hub import RunnerUnavailable, hub
 from app.modules.test_management.discovery import normalize_match_key
 
 
@@ -735,14 +735,27 @@ def run_tests_flow(payload: schemas.TestRunCreate, db: Session) -> dict:
     }
 
 
-# Test sources live with the suite on the runner's machine, so it reads them.
-def discover_automation_tests_flow(path: str) -> list[dict]:
-    return runner_client.call("GET", "/discovery/automation-tests", params={"path": path}, timeout=15)
+# Test sources live with the suite on the runner's machine, so it reads them. With
+# the runner offline these panels are empty rather than errors.
+async def discover_automation_tests_flow(path: str) -> list[dict]:
+    try:
+        return await hub.request("discover_tests", {"path": path}, timeout=15)
+    except RunnerUnavailable:
+        return []
 
 
-def discover_type_folder_flow(type_label: str) -> list[dict]:
+async def discover_type_folder_flow(type_label: str) -> list[dict]:
     """Folder tests physically under tests/test_suites/<type>/ (folder = type authority)."""
-    return runner_client.call("GET", "/discovery/type-folder", params={"type": type_label}, timeout=15)
+    try:
+        return await hub.request("discover_type_folder", {"type": type_label}, timeout=15)
+    except RunnerUnavailable:
+        return []
+
+
+def test_case_type_tags_flow(db: Session) -> dict:
+    """Every test case's key and test types, for the suite's --test-type filter."""
+    rows = db.execute(select(TestCase.testcase_key, TestCase.test_types)).all()
+    return {"items": {key: list(types or []) for key, types in rows}}
 
 
 def list_test_runs_flow(

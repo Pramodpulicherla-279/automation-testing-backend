@@ -173,6 +173,12 @@ def download_bulk_template():
     )
 
 
+@router.get("/test-cases/type-tags")
+def test_case_type_tags(db: Session = Depends(get_db)):
+    """testcase_key -> test_types; the suite uses it to filter shared tests by type."""
+    return service.test_case_type_tags_flow(db)
+
+
 @router.get("/test-cases", response_model=schemas.PaginatedResponse[schemas.TestCaseRead])
 def list_test_cases(
     application_id: int | None = None,
@@ -206,14 +212,14 @@ def delete_test_case(testcase_id: int, db: Session = Depends(get_db)):
 
 # ── Automation discovery ──────────────────────────────────────────────────
 @router.get("/automation-tests", response_model=list[schemas.AutomationTestCase])
-def discover_automation_tests(path: str):
-    return service.discover_automation_tests_flow(path)
+async def discover_automation_tests(path: str):
+    return await service.discover_automation_tests_flow(path)
 
 
 @router.get("/test-type-tests", response_model=list[schemas.TypeFolderTest])
-def discover_type_folder_tests(type: str):
+async def discover_type_folder_tests(type: str):
     """Tests physically located under tests/test_suites/<type>/ (folder-defined type)."""
-    return service.discover_type_folder_flow(type)
+    return await service.discover_type_folder_flow(type)
 
 
 # ── Test Runs ─────────────────────────────────────────────────────────────

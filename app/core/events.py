@@ -4,7 +4,6 @@ from app.core.websocket import manager
 from app.modules.api_testing.db_service import db
 from app.core.logger import setup_logger
 from app.core.state import state
-from app.core.utils import ensure_adb_server
 
 logger = setup_logger()
 
@@ -28,11 +27,6 @@ async def lifespan(app):
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         raise
-
-    if await asyncio.to_thread(ensure_adb_server):
-        logger.info("✅ adb server ready for device detection")
-    else:
-        logger.warning("⚠️ adb server could not be started; check that platform-tools is installed")
 
     yield
 

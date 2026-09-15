@@ -2,10 +2,9 @@
 
 FastAPI backend for the test automation platform: the test management database
 and API, the WebSocket the UI listens on, Jira and Slack integration, and
-orchestration of test runs. The runs themselves (the Android device, Appium,
-APKs, pytest and Allure) happen on the **runner** in the
-[`automation-testing`](../automation-testing) repo, which this service calls
-over HTTP.
+orchestration of test runs. The runs themselves — Android device, Appium, APKs,
+pytest, Allure — happen on the **test runner** in the
+[`automation-testing`](../automation-testing) repo, on the laptop.
 
 Split out of the `test-automation-platform` mono repo alongside
 [`automation-testing`](../automation-testing) and
@@ -16,50 +15,49 @@ package was renamed `new_backend` → `app` in the process.
 
 ```
 app/                        the FastAPI application (was new_backend/)
-app/core/runner_client.py   HTTP client for the runner (RUNNER_URL, RUNNER_TOKEN)
-app/core/paths.py           filesystem roots, used where the runner imports this package
+app/core/runner_hub.py      the connection to the test runner
+app/modules/runner/         /runner/status and the runner's WebSocket (/runner/ws)
 migrations/                 Alembic migrations
 alembic.ini                 script_location = migrations
 ```
 
-## How it reaches the device
+## How it reaches the laptop
+
+Nothing on this side knows the laptop's address. The runner connects **out** to
+this backend at `/runner/ws` and keeps the WebSocket open. Commands go down it,
+and replies, a status heartbeat and run-finished events come back up:
 
 ```
-frontend ──HTTP──► backend ──HTTP + RUNNER_TOKEN──► runner (laptop)
-                     ▲                                 │  pytest · Appium · adb · APKs
-                     └──── logs, module status, ───────┘
-                           run-finished
+frontend ──HTTPS──► backend ◄──WebSocket (opened by the laptop)── runner
+                       ▲                                           │ pytest · Appium · adb · APKs
+                       └──── logs, module status, results (HTTPS) ─┘
 ```
 
-The `/test/*` endpoints keep their paths and payloads, so the frontend is
-unchanged. Behind them, each call goes to the runner:
+The repos share no code or file paths; everything goes over these URLs. There
+is no authentication anywhere: whatever connects to `/runner/ws` is the runner,
+and the newest connection replaces an older one. That is also how the laptop
+reconnects after a drop or a backend redeploy. The connection lives in this
+process, so run the backend as a **single process** (no multiple workers or
+instances).
 
-| Backend endpoint | Runner call |
-|---|---|
-| `GET /test/device-status` | `GET /device-status` |
-| `GET /test/appium/status`, `POST /test/appium/start` · `stop` | `/appium/…` |
-| `GET /test/apk-list` | `GET /apks` |
-| `POST /test/start-test`, `/test/start-test-existing` | `POST /apks/prepare`, then `POST /runs` |
-| `POST /test/stop-test` | `POST /runs/stop` |
-| `POST /test/generate-report`, `/test/allure/start` | `POST /report`, `POST /allure/start` |
-| `GET /api/automation-tests`, `/api/test-type-tests` | `GET /discovery/…` |
+The `/test/*` endpoints keep their paths and payloads, so the frontend didn't
+change. Behind them:
 
-A run executes in the background on the runner. When it ends, the runner calls
-`POST /test/runner/run-finished` (checked against `RUNNER_TOKEN`), which sends
-the Slack summary.
-
-If the runner can't be reached, or rejects the token, those endpoints answer
-**503** with the reason. The two status polls instead read as "no device" and
-"Appium stopped", so the UI isn't flooded with errors. The rest of the API is
-unaffected.
+- **Status polls** (`/test/device-status`, `/test/appium/status`) answer from
+  the runner's latest heartbeat. With no runner they read as "no device" and
+  "Appium stopped".
+- **Lists the page loads on open** (`/test/apk-list`, `/api/automation-tests`,
+  `/api/test-type-tests`) come from the runner. With no runner they are empty,
+  not errors.
+- **Actions** (start and stop runs, Appium start and stop, reports) are
+  commands to the runner. With no runner they answer **503** with the reason.
+- `GET /runner/status` reports whether a runner is connected, and which machine.
 
 ## Where it can run
 
-Anywhere. It no longer needs the tests repo, adb, Appium or Allure on its own
-host. For a cloud deploy (e.g. Render), set:
+Anywhere, including Render. It needs no tests repo, adb, Appium or Allure. For a
+cloud deploy, set:
 
-- `RUNNER_URL` — the tunnel URL that reaches the runner on the laptop.
-- `RUNNER_TOKEN` — the same value the runner uses.
 - `CORS_ALLOW_ORIGINS` — include the deployed frontend's URL, or the browser
   blocks every call.
 - `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` /
@@ -71,7 +69,7 @@ host. For a cloud deploy (e.g. Render), set:
 ```bash
 python -m venv .venv && .venv/Scripts/activate
 pip install -r requirements.txt
-cp .env.example .env          # RUNNER_URL, RUNNER_TOKEN, CORS_ALLOW_ORIGINS
+cp .env.example .env          # CORS_ALLOW_ORIGINS
 cp app/.env.example app/.env  # DB and integration secrets
 ```
 
@@ -80,9 +78,6 @@ cp app/.env.example app/.env  # DB and integration secrets
 ```bash
 python -X utf8 -m uvicorn app.main:app --reload --port 8000
 ```
-
-Start the runner as well (see the `automation-testing` README). Without it the
-UI shows no device and runs can't start.
 
 Migrations:
 

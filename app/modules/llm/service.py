@@ -7,7 +7,6 @@ from fastapi import HTTPException
 from app.core.logger import logger
 from app.core.utils import latest_run_id
 from app.core.constants import UI_SCREENSHOTS_BASE
-from app.core.paths import UI_PARSER_DIR
 from .generate_jira_desc import generate_jira_description, generate_jira_title
 
 
@@ -56,9 +55,9 @@ async def analyze_ui_screenshots_flow(req):
     if not run_dir.exists():
         raise HTTPException(404, detail=f"Run screenshots folder not found: {run_id}")
 
-    validator = UI_PARSER_DIR / "ui_screenshot_validator.py"
-    if not validator.exists():
-        raise HTTPException(500, detail=f"Validator script not found: {validator}")
+    # The ui-parser validator and the screenshots live on the runner's machine,
+    # and this analysis hasn't been moved onto the runner yet.
+    raise HTTPException(503, detail="UI screenshot analysis runs on the test runner and isn't wired to it yet.")
 
     # Call validator as subprocess to avoid import issues (folder name ui-parser has a hyphen)
     cmd = [sys.executable, str(validator), "--root-dir", str(run_dir)]

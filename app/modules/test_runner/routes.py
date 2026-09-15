@@ -1,8 +1,6 @@
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
-
-from app.core import runner_client
-from .models import TestRequest, ExistingTestRequest, RunCompleteEvent, RunFinishedEvent, LogMessage
-from .service import start_test_flow, stop_test_flow, start_test_existing_flow, list_apks_flow, appium_start_flow, appium_status_flow, appium_stop_flow, allure_start_flow, device_status_flow, run_complete_flow, module_status_flow, api_generate_report_flow, log_step_flow, runner_run_finished_flow
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from .models import TestRequest, ExistingTestRequest, RunCompleteEvent, LogMessage
+from .service import start_test_flow, stop_test_flow, start_test_existing_flow, list_apks_flow, appium_start_flow, appium_status_flow, appium_stop_flow, allure_start_flow, device_status_flow, run_complete_flow, module_status_flow, api_generate_report_flow, log_step_flow, jira_assignee_name_flow
 
 router = APIRouter()
 
@@ -65,14 +63,7 @@ async def generate_report():
     return await api_generate_report_flow()
 
 
-@router.post("/runner/run-finished")
-async def runner_run_finished(
-    event: RunFinishedEvent,
-    background_tasks: BackgroundTasks,
-    x_runner_token: str = Header(default=""),
-):
-    # Only the runner may report results: they trigger the Slack summary.
-    if not runner_client.is_runner_token(x_runner_token):
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Runner-Token")
-    background_tasks.add_task(runner_run_finished_flow, event)
-    return {"ok": True}
+# The suite asks for this instead of holding Jira credentials on the laptop.
+@router.get("/jira/assignee-name")
+def jira_assignee_name():
+    return jira_assignee_name_flow()

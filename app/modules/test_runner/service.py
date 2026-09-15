@@ -1,22 +1,24 @@
 """Test-run orchestration.
 
 Everything that touches the Android device, Appium, APK files or the suite runs
-on the runner (automation-testing/runner) on the machine that has them; these
-flows reach it through app/core/runner_client.py. That keeps this service free
-to run anywhere, including a cloud host.
+on the laptop's test runner, which keeps a WebSocket open to this backend
+(app/core/runner_hub.py). This service holds no files or tools of its own, so it
+can run anywhere, including a cloud host.
 """
 
 import json
 
+import requests
 from fastapi import HTTPException
 
-from app.core import runner_client
 from app.core.constants import SLACK_NOTIFY_CHANNEL
 from app.core.events import broadcast_async
 from app.core.logger import logger
+from app.core.runner_hub import DOWNLOAD_TIMEOUT, RunnerUnavailable, hub
 from app.core.state import PAYLOAD_PREFIXES, current_test_name, reset_run_state, runs, test_steps_store
 from app.core.utils import parse_step_from_message
 from app.core.websocket import manager
+from app.modules.jira.jira_config import config as jira_config
 from app.modules.slack.config import APP_DEVELOPER_MAP, APP_VARIANTS
 from app.modules.slack.service import detect_app_variant, new_run, notify_run_finished, start_remote_run
 
@@ -74,33 +76,34 @@ async def log_step_flow(msg):
 
 
 # ── Device / Appium / APKs ──────────────────────────────────────────────────
-# The UI polls the two status endpoints every few seconds, so an unreachable
-# runner reads as "no device / Appium stopped" instead of an error per poll.
+# The UI polls the two status endpoints every few seconds. They answer from the
+# runner's latest heartbeat instead of a round trip, and read as "no device" /
+# "stopped" while no runner is connected.
 
 async def device_status_flow():
-    try:
-        return await runner_client.acall("GET", "/device-status", timeout=5)
-    except runner_client.RunnerUnavailable:
-        return {"connected": False}
+    status = hub.heartbeat() or {}
+    return {"connected": bool(status.get("device_connected"))}
 
 
 async def appium_status_flow():
-    try:
-        return await runner_client.acall("GET", "/appium/status", timeout=5)
-    except runner_client.RunnerUnavailable:
-        return {"status": "stopped"}
+    status = hub.heartbeat() or {}
+    return {"status": status.get("appium", "stopped")}
 
 
 async def appium_start_flow():
-    return await runner_client.acall("POST", "/appium/start", timeout=30)
+    return await hub.request("appium_start", timeout=30)
 
 
 async def appium_stop_flow():
-    return await runner_client.acall("POST", "/appium/stop", timeout=30)
+    return await hub.request("appium_stop", timeout=30)
 
 
 async def list_apks_flow():
-    return await runner_client.acall("GET", "/apks")
+    # Loaded when the page opens: with the runner offline that is an empty list, not an error.
+    try:
+        return await hub.request("list_apks")
+    except RunnerUnavailable:
+        return {"apks": []}
 
 
 async def module_status_flow(data: dict):
@@ -192,10 +195,7 @@ async def start_test_flow(request):
         "message": "Downloading the APK on the runner...", "status": "INFO",
     }})
     try:
-        prepared = await runner_client.acall(
-            "POST", "/apks/prepare", json={"url": request.url},
-            timeout=runner_client.DOWNLOAD_TIMEOUT,
-        )
+        prepared = await hub.request("prepare_apk", {"url": request.url}, timeout=DOWNLOAD_TIMEOUT)
     except HTTPException as exc:
         await manager.broadcast({"type": "LOG", "payload": {
             "message": f"Download interrupted: {exc.detail}", "status": "FAILED",
@@ -207,9 +207,7 @@ async def start_test_flow(request):
 async def start_test_existing_flow(request):
     run_id = _begin_run(request)
     # Reading the APK's manifest and icon on the runner takes a few seconds.
-    prepared = await runner_client.acall(
-        "POST", "/apks/prepare", json={"apk_name": request.apk_name}, timeout=120,
-    )
+    prepared = await hub.request("prepare_apk", {"apk_name": request.apk_name}, timeout=120)
     await manager.broadcast({"type": "RUN_START", "payload": {}})
     await manager.broadcast({"type": "LOG", "payload": {
         "message": f"Using existing APK: {request.apk_name}", "status": "INFO",
@@ -220,12 +218,12 @@ async def start_test_existing_flow(request):
 # ── Stopping / reporting ────────────────────────────────────────────────────
 
 async def stop_test_flow() -> bool:
-    result = await runner_client.acall("POST", "/runs/stop", timeout=15)
+    result = await hub.request("stop_run", timeout=15)
     return bool(result.get("stopped"))
 
 
 async def allure_start_flow():
-    return await runner_client.acall("POST", "/allure/start", timeout=30)
+    return await hub.request("allure_start", timeout=30)
 
 
 async def run_complete_flow(event):
@@ -234,14 +232,41 @@ async def run_complete_flow(event):
 
 
 async def api_generate_report_flow():
-    return await runner_client.acall("POST", "/report", timeout=30)
+    return await hub.request("generate_report", timeout=30)
 
 
-async def runner_run_finished_flow(event):
+async def _on_run_finished(payload: dict) -> None:
     await notify_run_finished(
-        event.run_id,
-        passed=event.passed,
-        failed=event.failed,
-        stopped=event.stopped,
-        error=event.error,
+        payload.get("run_id", ""),
+        passed=int(payload.get("passed") or 0),
+        failed=int(payload.get("failed") or 0),
+        stopped=bool(payload.get("stopped")),
+        error=payload.get("error"),
     )
+
+
+# The runner reports the end of a run over its connection, which is what
+# authenticates it — no separate callback URL or token needed.
+hub.on_event("run-finished", _on_run_finished)
+
+
+def jira_assignee_name_flow() -> dict:
+    """Display name of the configured Jira assignee.
+
+    Resolved here so the laptop needs no Jira credentials; the suite records it
+    as who triggered the run.
+    """
+    if not (jira_config.assignee_id and jira_config.url and jira_config.email and jira_config.api_token):
+        return {"name": ""}
+    try:
+        resp = requests.get(
+            f"{jira_config.url}/rest/api/3/user",
+            params={"accountId": jira_config.assignee_id},
+            auth=jira_config.auth,
+            headers={"Accept": "application/json"},
+            timeout=8,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Jira assignee lookup failed: %s", exc)
+        return {"name": ""}
+    return {"name": (resp.json() or {}).get("displayName", "") if resp.ok else ""}

@@ -12,18 +12,15 @@ import uuid
 import datetime
 import sys
 import socket
-from app.core import runner_client
-from app.core.paths import TESTS_ROOT
+from app.core.runner_hub import DOWNLOAD_TIMEOUT, hub
 from app.core.state import runs, is_appium_running, APPIUM_PORT, PROCESSED_EVENTS, appium_proc, latest_run_id
-from app.core.utils import start_allure_server
 from app.core.websocket import manager
-from app.modules.test_runner.gdrive_loader import get_apk_info
 from app.core.constants import SLACK_BOT_TOKEN, SLACK_NOTIFY_CHANNEL, ALLURE_CMD
 from .config import APP_CONFIG, PACKAGE_VARIANT_MAP, APP_VARIANTS, APP_DEVELOPER_MAP
 
-BASE_DIR = str(TESTS_ROOT)
-print(f"[DEBUG] BASE_DIR = {BASE_DIR}")
-print(f"[DEBUG] allure-results path = {os.path.join(BASE_DIR, 'allure-results')}")
+# The git / GitHub Pages report-publishing helpers below are disabled; allure-report
+# is generated on the runner's machine, so they would have to move there to work.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # PACKAGE_VARIANT_MAP = {
 #     "com.agribride.krishivaas.farmer_app":       "regular_farmer",
@@ -520,7 +517,7 @@ async def start_remote_run(
 
     # ── Step 1 — start the tests on the runner ───────────────────────────────
     log_to_ui(f"[{run_id[:8]}] Step 1: Running tests on the runner...", "INFO")
-    result = await runner_client.acall("POST", "/runs", timeout=30, json={
+    result = await hub.request("start_run", timeout=30, payload={
         "run_id":         run_id,
         "apk_name":       apk_name,
         "tests_to_run":   tests_to_run,
@@ -585,7 +582,7 @@ async def notify_run_finished(
     # Re-enable once these are moved to a dedicated background worker.
     #
     # 1. Start local server
-    # local_url  = await loop.run_in_executor(None, start_allure_server)
+    # local_url  = (await hub.request("allure_start"))["url"]   # served by the runner
     # 2. Push to GitHub
     # await loop.run_in_executor(None, lambda: auto_push_to_github(run_id))
     # 3. Deploy to GitHub Pages
@@ -747,90 +744,6 @@ def _normalize_apk_info(raw: dict) -> dict:
 
     return normalized
 
-def _extract_apk_info_fallback(apk_path: str) -> dict:
-    """
-    Try to extract APK metadata using aapt/aapt2 CLI tools directly.
-    Called when get_apk_info() returns incomplete data.
-    Returns dict with app_name, package_name, app_version.
-    """
-    result = {"app_name": "", "package_name": "", "app_version": ""}
-
-    # Try aapt first
-    for tool in ("aapt", "aapt2"):
-        try:
-            cmd = [tool, "dump", "badging", apk_path]
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=30
-            )
-            output = proc.stdout
-            if not output:
-                continue
-
-            # package: name='com.example' versionCode='10' versionName='1.0'
-            pkg_match = re.search(r"package:\s+name='([^']+)'.*?versionName='([^']*)'", output)
-            if pkg_match:
-                result["package_name"] = pkg_match.group(1).strip()
-                result["app_version"]  = pkg_match.group(2).strip()
-
-            # application-label:'App Name'  OR  application-label-en:'App Name'
-            label_match = re.search(r"application-label(?:-\w+)?:'([^']+)'", output)
-            if label_match:
-                result["app_name"] = label_match.group(1).strip()
-
-            # application: label='App Name'
-            if not result["app_name"]:
-                app_match = re.search(r"application:.*?label='([^']+)'", output)
-                if app_match:
-                    result["app_name"] = app_match.group(1).strip()
-
-            if result["package_name"]:
-                print(f"[aapt fallback ({tool})] app='{result['app_name']}' "
-                      f"pkg='{result['package_name']}' ver='{result['app_version']}'")
-                return result
-
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            print(f"[aapt fallback ({tool})] Error: {e}")
-            continue
-
-    print("[aapt fallback] All tools failed — returning empty dict")
-    return result
-
-def _get_full_apk_info(apk_path: str) -> dict:
-    """
-    Primary entry point for APK metadata extraction.
-    1. Calls get_apk_info() from gdrive_loader
-    2. Normalizes all keys
-    3. If package_name is still missing → runs aapt/aapt2 fallback
-    4. Returns a fully populated dict with guaranteed stable keys
-    """
-    try:
-        raw_info = get_apk_info(apk_path) or {}
-    except Exception as e:
-        print(f"[get_apk_info] Exception: {e}")
-        raw_info = {}
-
-    info = _normalize_apk_info(raw_info)
-
-    # If critical fields are still missing, try aapt fallback
-    if not info["package_name"] or info["app_name"] == "Unknown App":
-        print("[get_full_apk_info] Primary extraction incomplete — trying aapt fallback...")
-        fallback = _extract_apk_info_fallback(apk_path)
-
-        if fallback.get("package_name") and not info["package_name"]:
-            info["package_name"] = fallback["package_name"]
-        if fallback.get("app_name") and info["app_name"] == "Unknown App":
-            info["app_name"] = fallback["app_name"]
-        if fallback.get("app_version") and info["app_version"] == "Unknown Version":
-            info["app_version"] = fallback["app_version"]
-
-        print(f"[get_full_apk_info] After fallback → app='{info['app_name']}' "
-              f"pkg='{info['package_name']}' ver='{info['app_version']}'")
-
-    return info
-
 async def handle_slack_apk(
     file_id: str,
     channel_id: str,
@@ -853,10 +766,7 @@ async def handle_slack_apk(
         })
 
         # ── The runner downloads the APK onto the machine with the device ─────
-        prepared = await runner_client.acall(
-            "POST", "/apks/prepare", json={"url": download_url},
-            timeout=runner_client.DOWNLOAD_TIMEOUT,
-        )
+        prepared = await hub.request("prepare_apk", {"url": download_url}, timeout=DOWNLOAD_TIMEOUT)
         info         = _normalize_apk_info(prepared.get("info"))
         package_name = info["package_name"]
         app_name     = info["app_name"]
@@ -893,7 +803,7 @@ async def handle_slack_apk(
         })
 
         # No one is at the UI to press Start, so bring Appium up and wait for it.
-        await runner_client.acall("POST", "/appium/start", params={"wait": 15}, timeout=30)
+        await hub.request("appium_start", {"wait": 15}, timeout=30)
 
         await start_remote_run(
             run_id=run_id,

@@ -6,7 +6,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from app.core.runner_client import RunnerUnavailable
+from app.core.runner_hub import RunnerUnavailable
+from app.modules.runner.routes import router as runner_router
 from app.modules.test_runner.routes import router as test_router
 from app.modules.jira.routes import router as jira_router
 from app.modules.llm.routes import router as llm_router
@@ -61,6 +62,7 @@ app.add_middleware(
 app.include_router(websocket_router, prefix="/ws")
 app.include_router(test_router, prefix="/test")
 app.include_router(test_management_router, prefix="/api")
+app.include_router(runner_router, prefix="/runner")
 # app.include_router(jira_router, prefix="/jira")
 # app.include_router(llm_router, prefix="/llm")
 # app.include_router(slack_router, prefix="/slack")
